@@ -1,0 +1,879 @@
+/* eslint-disable @typescript-eslint/no-floating-promises */
+
+import { afterAll, test } from "bun:test";
+import { createFixture } from "fs-fixture";
+import assert from "node:assert/strict";
+import os from "node:os";
+import path from "node:path";
+import { describe } from "node:test";
+
+import { glob, globSync } from "~/mod.js";
+import { getPartialMatcher } from "~/utils.js";
+import { isDynamicPattern } from "~/utils.js";
+import { escapePosixPath, escapeWin32Path } from "~/utils.js";
+import {
+  convertPosixPathToPattern,
+  convertWin32PathToPattern,
+} from "~/utils.js";
+
+const isWindows = os.platform() === "win32";
+
+const fixture = await createFixture({
+  a: {
+    "a.txt": "a",
+    "b.txt": "b",
+  },
+  b: {
+    "a.txt": "a",
+    "b.txt": "b",
+  },
+  ".a/a/a.txt": "a",
+  ".[a]/a.txt": "a",
+  ".deep/a/a/a.txt": "a",
+  ...(isWindows
+    ? {}
+    : {
+        ".symlink": {
+          file: ({ symlink }) => symlink("../a/a.txt"),
+          dir: ({ symlink }) => symlink("../a"),
+          ".recursive": ({ symlink }) => symlink(".."),
+        },
+      }),
+});
+
+const cwd = fixture.path;
+
+afterAll(() => fixture.rm());
+
+test("directory expansion", async () => {
+  const files = await glob({ patterns: ["a"], cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "a/b.txt"]);
+});
+
+test("empty array matches nothing", async () => {
+  const files = await glob({ patterns: [] });
+  assert.deepEqual(files.sort(), []);
+});
+
+test("only double star", async () => {
+  const files = await glob({ patterns: ["**"], cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "a/b.txt", "b/a.txt", "b/b.txt"]);
+});
+
+test("no directory expansion if expandDirectories is set to false", async () => {
+  const files = await glob({ patterns: ["a"], expandDirectories: false, cwd });
+  assert.deepEqual(files.sort(), []);
+});
+
+test("classic patterns as first argument", async () => {
+  const files = await glob(["a/*.txt"], { cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "a/b.txt"]);
+});
+
+test("can't have both classic patterns and options' patterns", async () => {
+  // @ts-expect-error TODO: fix ts
+
+  assert.rejects(glob(["a/*.txt"], { patterns: ["whoops!"], cwd }));
+
+  // @ts-expect-error TODO: fix ts
+  assert.throws(() => globSync(["a/*.txt"], { patterns: ["whoops!"], cwd }));
+});
+
+test("negative patterns", async () => {
+  const files = await glob({ patterns: ["**/a.txt", "!b/a.txt"], cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt"]);
+});
+
+test("negative patterns setting root as /", async () => {
+  const files = await glob({ patterns: ["**/a.txt", "!/b/a.txt"], cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "b/a.txt"]);
+});
+
+test("patterns as string", async () => {
+  const files = await glob("a/a.txt", { cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt"]);
+});
+
+test("ignore option", async () => {
+  const files = await glob({
+    patterns: ["**/a.txt"],
+    ignore: ["b/a.txt"],
+    cwd,
+  });
+  assert.deepEqual(files.sort(), ["a/a.txt"]);
+});
+
+test("ignore option as string", async () => {
+  const files = await glob({ patterns: ["**/a.txt"], ignore: "b/a.txt", cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt"]);
+});
+
+test("ignore option with an empty string array", async () => {
+  const files = await glob({ patterns: ["**/a.txt"], ignore: [""], cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "b/a.txt"]);
+});
+
+test("caseSensitiveMatch", async () => {
+  const files = await glob({
+    patterns: ["**/A.TXT"],
+    caseSensitiveMatch: false,
+    cwd,
+  });
+  assert.deepEqual(files.sort(), ["a/a.txt", "b/a.txt"]);
+});
+
+test("caseSensitiveMatch (default)", async () => {
+  const files = await glob({ patterns: ["**/A.TXT"], cwd });
+  assert.deepEqual(files.sort(), []);
+});
+
+test("caseSensitiveMatch with ignore", async () => {
+  const files = await glob({
+    patterns: ["**/A.TXT"],
+    ignore: ["B/**"],
+    caseSensitiveMatch: false,
+    cwd,
+  });
+  assert.deepEqual(files.sort(), ["a/a.txt"]);
+});
+
+test("onlyDirectories option", async () => {
+  const files = await glob({ patterns: ["a"], onlyDirectories: true, cwd });
+  assert.deepEqual(files.sort(), ["a/"]);
+});
+
+test("onlyFiles option", async () => {
+  const files = await glob({ patterns: ["a"], onlyFiles: false, cwd });
+  assert.deepEqual(files.sort(), ["a/", "a/a.txt", "a/b.txt"]);
+});
+
+test("onlyDirectories has preference over onlyFiles", async () => {
+  const files = await glob({
+    patterns: ["a"],
+    onlyDirectories: true,
+    onlyFiles: true,
+    cwd,
+  });
+  assert.deepEqual(files.sort(), ["a/"]);
+});
+
+test("matching only a directory works", async () => {
+  const files = await glob({
+    patterns: ["a"],
+    onlyFiles: false,
+    expandDirectories: false,
+    cwd,
+  });
+  assert.deepEqual(files.sort(), ["a/"]);
+});
+
+test("expandDirectories true", async () => {
+  const files = await glob({ patterns: ["a"], expandDirectories: true, cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "a/b.txt"]);
+});
+
+test("no expandDirectories doesn't break common path inferring", async () => {
+  const files = await glob({
+    patterns: ["a/a.txt"],
+    expandDirectories: false,
+    cwd,
+  });
+  assert.deepEqual(files.sort(), ["a/a.txt"]);
+});
+
+test("expandDirectories doesn't break common path inferring either", async () => {
+  const files = await glob({
+    patterns: ["a/a.txt"],
+    expandDirectories: true,
+    cwd,
+  });
+  assert.deepEqual(files.sort(), ["a/a.txt"]);
+});
+
+test("handle absolute patterns that don't escape the cwd", async () => {
+  const files = await glob({
+    patterns: [`${cwd.replaceAll("\\", "/")}a/a.txt`],
+    cwd,
+  });
+  assert.deepEqual(files.sort(), ["a/a.txt"]);
+});
+
+test("fully handle absolute patterns", async () => {
+  const files = await glob({
+    patterns: [
+      `${cwd.replaceAll("\\", "/")}a/a.txt`,
+      `${cwd.replaceAll("\\", "/")}b/a.txt`,
+    ],
+    cwd: path.join(cwd, "a"),
+  });
+  assert.deepEqual(files.sort(), ["../b/a.txt", "a.txt"]);
+});
+
+test("escaped absolute patterns", async () => {
+  const files = await glob({
+    patterns: [`${cwd.replaceAll("\\", "/")}.\\[a\\]/a.txt`],
+    absolute: true,
+    cwd: path.join(cwd, ".[a]"),
+  });
+  assert.deepEqual(files.sort(), [`${cwd.replaceAll("\\", "/")}.[a]/a.txt`]);
+});
+
+test("leading ../", async () => {
+  const files = await glob({
+    patterns: ["../b/*.txt"],
+    cwd: path.join(cwd, "a"),
+  });
+  assert.deepEqual(files.sort(), ["../b/a.txt", "../b/b.txt"]);
+});
+
+test("leading ../ plus normal pattern", async () => {
+  const files = await glob({
+    patterns: ["../b/*.txt", "a.txt"],
+    cwd: path.join(cwd, "a"),
+  });
+  assert.deepEqual(files.sort(), ["../b/a.txt", "../b/b.txt", "a.txt"]);
+});
+
+test("leading ../ with absolute on", async () => {
+  const files = await glob({
+    patterns: ["../b/*.txt"],
+    absolute: true,
+    cwd: path.join(cwd, "a"),
+  });
+  assert.deepEqual(files.sort(), [
+    `${cwd.replaceAll("\\", "/")}b/a.txt`,
+    `${cwd.replaceAll("\\", "/")}b/b.txt`,
+  ]);
+});
+
+test("bracket expanding", async () => {
+  const files = await glob({ patterns: ["a/{a,b}.txt"], cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "a/b.txt"]);
+});
+
+test("dot", async () => {
+  const files = await glob({
+    patterns: ["a/a.txt"],
+    dot: true,
+    cwd: path.join(cwd, ".a"),
+  });
+  assert.deepEqual(files.sort(), ["a/a.txt"]);
+});
+
+test("no common path optimization", async () => {
+  const files = await glob({ patterns: [".deep/a/a/*.txt", "a/a.*"], cwd });
+  assert.deepEqual(files.sort(), [".deep/a/a/a.txt", "a/a.txt"]);
+});
+
+test("deep", async () => {
+  const files = await glob({ patterns: [".deep/a/a/*.txt"], deep: 3, cwd });
+  assert.deepEqual(files.sort(), [".deep/a/a/a.txt"]);
+
+  const files2 = await glob({ patterns: [".deep/a/a/*.txt"], deep: 2, cwd });
+  assert.deepEqual(files2.sort(), []);
+
+  const files3 = await glob({ patterns: [".deep/a/a/*.txt"], deep: 1, cwd });
+  assert.deepEqual(files3.sort(), []);
+});
+
+test("deep with ../", async () => {
+  const files = await glob({
+    patterns: ["../.deep/a/a/*.txt", "a.txt"],
+    deep: 3,
+    cwd: path.join(cwd, "a"),
+  });
+  assert.deepEqual(files.sort(), ["../.deep/a/a/a.txt", "a.txt"]);
+
+  const files2 = await glob({
+    patterns: ["../.deep/a/a/*.txt", "a.txt"],
+    deep: 2,
+    cwd: path.join(cwd, "a"),
+  });
+  assert.deepEqual(files2.sort(), ["../.deep/a/a/a.txt", "a.txt"]);
+
+  const files3 = await glob({
+    patterns: ["../.deep/a/a/*.txt", "a.txt"],
+    deep: 1,
+    cwd: path.join(cwd, "a"),
+  });
+  assert.deepEqual(files3.sort(), ["a.txt"]);
+});
+
+test("absolute", async () => {
+  const files = await glob({ patterns: ["a/a.txt"], cwd, absolute: true });
+  assert.deepEqual(files.sort(), [`${cwd.replaceAll("\\", "/")}a/a.txt`]);
+});
+
+test("absolute + dot", async () => {
+  const files = await glob({
+    patterns: ["a/a.txt"],
+    dot: true,
+    cwd: path.join(cwd, ".a"),
+    absolute: true,
+  });
+  assert.deepEqual(files.sort(), [`${cwd.replaceAll("\\", "/")}.a/a/a.txt`]);
+});
+
+test("absolute + empty commonPath", async () => {
+  const files = await glob({
+    patterns: ["a/**.txt"],
+    cwd,
+    absolute: true,
+    expandDirectories: false,
+  });
+  assert.deepEqual(files.sort(), [
+    `${cwd.replaceAll("\\", "/")}a/a.txt`,
+    `${cwd.replaceAll("\\", "/")}a/b.txt`,
+  ]);
+});
+
+test("handle symlinks", async () => {
+  if (isWindows) {
+    console.log("Skipping symlink test on Windows");
+    return;
+  }
+  const files = await glob({ patterns: [".symlink/**"], cwd });
+  assert.deepEqual(files.sort(), [
+    ".symlink/dir/a.txt",
+    ".symlink/dir/b.txt",
+    ".symlink/file",
+  ]);
+});
+
+test("handle recursive symlinks", async () => {
+  if (isWindows) {
+    console.log("Skipping recursive symlink test on Windows");
+    return;
+  }
+  const files = await glob({
+    patterns: [".symlink/.recursive/**", "!.symlink/.recursive/**/.{a,deep}"],
+    dot: true,
+    cwd,
+  });
+  assert.deepEqual(files.sort(), [
+    ".symlink/.recursive/.[a]/a.txt",
+    ".symlink/.recursive/.symlink/file",
+    ".symlink/.recursive/a/a.txt",
+    ".symlink/.recursive/a/b.txt",
+    ".symlink/.recursive/b/a.txt",
+    ".symlink/.recursive/b/b.txt",
+  ]);
+});
+
+test("handle symlinks (absolute)", async () => {
+  if (isWindows) {
+    console.log("Skipping absolute symlink test on Windows");
+    return;
+  }
+  const files = await glob({ patterns: [".symlink/**"], absolute: true, cwd });
+  assert.deepEqual(files.sort(), [
+    `${cwd.replaceAll("\\", "/")}.symlink/dir/a.txt`,
+    `${cwd.replaceAll("\\", "/")}.symlink/dir/b.txt`,
+    `${cwd.replaceAll("\\", "/")}.symlink/file`,
+  ]);
+});
+
+test("handle recursive symlinks (absolute)", async () => {
+  if (isWindows) {
+    console.log("Skipping absolute recursive symlink test on Windows");
+    return;
+  }
+  const files = await glob({
+    patterns: [".symlink/.recursive/**", "!.symlink/.recursive/**/.{a,deep}"],
+    absolute: true,
+    dot: true,
+    cwd,
+  });
+  assert.deepEqual(files.sort(), [
+    `${cwd.replaceAll("\\", "/")}.symlink/.recursive/.[a]/a.txt`,
+    `${cwd.replaceAll("\\", "/")}.symlink/.recursive/.symlink/file`,
+    `${cwd.replaceAll("\\", "/")}.symlink/.recursive/a/a.txt`,
+    `${cwd.replaceAll("\\", "/")}.symlink/.recursive/a/b.txt`,
+    `${cwd.replaceAll("\\", "/")}.symlink/.recursive/b/a.txt`,
+    `${cwd.replaceAll("\\", "/")}.symlink/.recursive/b/b.txt`,
+  ]);
+});
+
+test("exclude symlinks if the option is disabled", async () => {
+  if (isWindows) {
+    console.log("Skipping symlink exclusion test on Windows");
+    return;
+  }
+  const files = await glob({
+    patterns: [".symlink/**"],
+    dot: true,
+    followSymbolicLinks: false,
+    expandDirectories: false,
+    cwd,
+  });
+  assert.deepEqual(files.sort(), []);
+});
+
+test(". works", async () => {
+  const files = await glob(["."], {
+    cwd,
+    expandDirectories: false,
+    onlyDirectories: true,
+  });
+  assert.deepEqual(files.sort(), ["."]);
+});
+
+test(". works (absolute)", async () => {
+  const files = await glob(["."], {
+    cwd,
+    absolute: true,
+    expandDirectories: false,
+    onlyDirectories: true,
+  });
+  assert.deepEqual(files.sort(), [cwd.replaceAll("\\", "/")]);
+});
+
+test("works with non-absolute cwd", async () => {
+  const files = await glob({ patterns: ["*.txt"], cwd: path.join(cwd, "a") });
+  assert.deepEqual(files.sort(), ["a.txt", "b.txt"]);
+});
+
+test("no patterns returns everything in cwd", async () => {
+  const files = await glob({ cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "a/b.txt", "b/a.txt", "b/b.txt"]);
+});
+
+test("**/* works", async () => {
+  const files = await glob({ patterns: ["**/*"], cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "a/b.txt", "b/a.txt", "b/b.txt"]);
+});
+
+test("matching files with specific naming pattern", async () => {
+  const files = await glob({ patterns: ["**/[a-c].txt"], cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "a/b.txt", "b/a.txt", "b/b.txt"]);
+});
+
+test("dynamic patterns that include slashes inside parts", async () => {
+  const files = await glob({ patterns: ["{.a/a,a}/a.txt"], cwd });
+  assert.deepEqual(files.sort(), [".a/a/a.txt", "a/a.txt"]);
+});
+
+test("using extglob patterns", async () => {
+  const files = await glob({ patterns: ["a/*(a|b).txt"], cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "a/b.txt"]);
+});
+
+test("pattern normalization", async () => {
+  const files1 = await glob({ patterns: ["a"], cwd });
+  const files2 = await glob({ patterns: ["a/"], cwd });
+  const files3 = await glob({ patterns: ["./a"], cwd });
+  assert.deepEqual(files1, files2);
+  assert.deepEqual(files1, files3);
+});
+
+test("negative patterns in options", async () => {
+  const files = await glob({ patterns: ["**/*.txt", "!**/b.txt"], cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "b/a.txt"]);
+
+  const files2 = await glob({ patterns: ["**/*.txt", "!**/a.txt"], cwd });
+  assert.deepEqual(files2.sort(), ["a/b.txt", "b/b.txt"]);
+});
+
+test("negative absolute patterns in options", async () => {
+  const files = await glob({
+    patterns: [
+      `${cwd.replaceAll("\\", "/")}**/*.txt`,
+      `!${cwd.replaceAll("\\", "/")}**/b.txt`,
+    ],
+    cwd,
+  });
+  assert.deepEqual(files.sort(), ["a/a.txt", "b/a.txt"]);
+
+  const files2 = await glob({
+    patterns: [
+      `${cwd.replaceAll("\\", "/")}**/*.txt`,
+      `!${cwd.replaceAll("\\", "/")}**/a.txt`,
+    ],
+    cwd,
+  });
+  assert.deepEqual(files2.sort(), ["a/b.txt", "b/b.txt"]);
+});
+
+// can't easily make them properly work right now
+// but at least it's consistent with fast-glob this way
+test("negative patterns in ignore are ignored", async () => {
+  const files = await glob({
+    patterns: ["**/*"],
+    ignore: ["**/b.txt", "!a/b.txt"],
+    cwd,
+  });
+  assert.deepEqual(files.sort(), ["a/a.txt", "b/a.txt"]);
+
+  const files2 = await glob({
+    patterns: ["**/*", "!**/b.txt", "!!a/b.txt"],
+    cwd,
+  });
+  assert.deepEqual(files2.sort(), ["a/a.txt", "b/a.txt"]);
+});
+
+test("sync version", () => {
+  const files = globSync(["a/*.txt"], { cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "a/b.txt"]);
+});
+
+test("sync version with no patterns", () => {
+  const files = globSync({ cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "a/b.txt", "b/a.txt", "b/b.txt"]);
+});
+
+test("sync version with no patterns and onlyDirectories", () => {
+  const files = globSync({ cwd, onlyDirectories: true });
+  assert.deepEqual(files.sort(), ["a/", "b/"]);
+});
+
+test("sync version with multiple patterns", () => {
+  const files = globSync({ patterns: ["a/*.txt", "b/*.txt"], cwd });
+  assert.deepEqual(files.sort(), ["a/a.txt", "a/b.txt", "b/a.txt", "b/b.txt"]);
+});
+
+test("sync with empty array matches nothing", () => {
+  const files = globSync({ patterns: [] });
+  assert.deepEqual(files.sort(), []);
+});
+
+test("*", async () => {
+  const files = await glob({
+    patterns: ["./*"],
+    cwd,
+    onlyDirectories: true,
+    expandDirectories: false,
+  });
+  assert.deepEqual(files.sort(), ["a/", "b/"]);
+});
+
+test(".a/*", async () => {
+  const files = await glob({
+    patterns: [".a/*"],
+    cwd,
+    onlyDirectories: true,
+    expandDirectories: false,
+  });
+  assert.deepEqual(files.sort(), [".a/a/"]);
+});
+
+test(". + .a/*", async () => {
+  const files = await glob({
+    patterns: [".", ".a/*"],
+    cwd,
+    onlyDirectories: true,
+    expandDirectories: false,
+  });
+  assert.deepEqual(files.sort(), [".", ".a/a/"]);
+});
+
+// ====================
+// convertPathToPattern
+// ====================
+
+for (const platform of ["posix", "win32"]) {
+  const convertPathToPattern =
+    platform === "posix"
+      ? convertPosixPathToPattern
+      : convertWin32PathToPattern;
+
+  describe(`convertPathToPattern (${platform})`, () => {
+    test("doesn't add backslashes to already escaped patterns", () => {
+      assert.strictEqual(convertPathToPattern("\\["), "\\[");
+
+      if (platform === "posix") {
+        assert.strictEqual(convertPathToPattern("\\|"), "\\|");
+      }
+    });
+
+    test("doesn't add wrong backslashes", () => {
+      assert.strictEqual(convertPathToPattern("hi!@+"), "hi!@+");
+    });
+
+    test("correctly escapes characters", () => {
+      assert.strictEqual(convertPathToPattern("!nox"), "\\!nox");
+      assert.strictEqual(
+        convertPathToPattern("hi+(@(!())))"),
+        "hi\\+\\(\\@\\(\\!\\(\\)\\)\\)\\)",
+      );
+
+      if (platform === "posix") {
+        assert.strictEqual(convertPathToPattern("\\"), "\\\\");
+        assert.strictEqual(convertPathToPattern("meo*w"), "meo\\*w");
+      } else if (platform === "win32") {
+        assert.strictEqual(
+          convertPathToPattern("New Folder (1)"),
+          "New Folder \\(1\\)",
+        );
+      }
+    });
+
+    if (platform === "win32") {
+      test("converts backslashes correctly", () => {
+        assert.strictEqual(
+          convertPathToPattern("\\\\?\\users\\**\\\\[my file\\]"),
+          "//?/users/**/\\[my file\\]",
+        );
+        assert.strictEqual(
+          convertPathToPattern("hi+(@(!())))"),
+          "hi\\+\\(\\@\\(\\!\\(\\)\\)\\)\\)",
+        );
+        assert.strictEqual(
+          convertPathToPattern("C:\\Users\\meeee\\New Folder (1)\\**"),
+          "C:/Users/meeee/New Folder \\(1\\)/**",
+        );
+      });
+    }
+  });
+}
+
+// ====================
+// escapePath
+// ====================
+
+for (const platform of ["posix", "win32"]) {
+  const escapePath = platform === "posix" ? escapePosixPath : escapeWin32Path;
+
+  describe(`escapePath (${platform})`, () => {
+    test("doesn't add backslashes to already escaped patterns", () => {
+      assert.strictEqual(escapeWin32Path("\\["), "\\[");
+
+      if (platform === "posix") {
+        assert.strictEqual(escapePath("\\|"), "\\|");
+      }
+    });
+
+    test("doesn't add wrong backslashes", () => {
+      assert.strictEqual(escapePath("hi!@+"), "hi!@+");
+    });
+
+    test("correctly escapes characters", () => {
+      assert.strictEqual(escapePath("!nox"), "\\!nox");
+      assert.strictEqual(
+        escapePath("hi+(@(!())))"),
+        "hi\\+\\(\\@\\(\\!\\(\\)\\)\\)\\)",
+      );
+
+      if (platform === "posix") {
+        assert.strictEqual(escapePath("\\"), "\\\\");
+        assert.strictEqual(escapePath("meo*w"), "meo\\*w");
+      } else if (platform === "win32") {
+        assert.strictEqual(
+          escapePath("C:\\Users\\meeee\\New Folder (1)\\**"),
+          "C:\\Users\\meeee\\New Folder \\(1\\)\\**",
+        );
+      }
+    });
+  });
+}
+
+// ====================
+// isDynamicPattern
+// ====================
+
+describe("isDynamicPattern", () => {
+  test("returns false on an empty string", () => {
+    assert.ok(!isDynamicPattern(""));
+  });
+
+  test("returns true if case sensitivity is disabled", () => {
+    assert.ok(isDynamicPattern("dfhghkfdgn", { caseSensitiveMatch: false }));
+  });
+
+  test("returns true on glob symbols", () => {
+    assert.ok(isDynamicPattern("*"));
+    assert.ok(isDynamicPattern("?"));
+    assert.ok(isDynamicPattern("src/*"));
+    assert.ok(isDynamicPattern("src/?"));
+    assert.ok(isDynamicPattern("!src"));
+  });
+
+  test("returns true on regex groups", () => {
+    assert.ok(isDynamicPattern("(a|b)"));
+    assert.ok(isDynamicPattern("(a|)"));
+    assert.ok(isDynamicPattern("a/(a|b)"));
+  });
+
+  test("returns true on character classes", () => {
+    assert.ok(isDynamicPattern("[ab]"));
+    assert.ok(isDynamicPattern("[^ab]"));
+    assert.ok(isDynamicPattern("[1-3]"));
+    assert.ok(isDynamicPattern("[[:alpha:]"));
+  });
+
+  test("returns true on extglobs", () => {
+    assert.ok(isDynamicPattern("@()"));
+    assert.ok(isDynamicPattern("@(a)"));
+    assert.ok(isDynamicPattern("@(a|b)"));
+    assert.ok(isDynamicPattern("a!(a|b)"));
+    assert.ok(isDynamicPattern("*(a|b)"));
+    assert.ok(isDynamicPattern("?(a|b)"));
+    assert.ok(isDynamicPattern("+(a|b)"));
+  });
+
+  test("returns true on brace expansions", () => {
+    assert.ok(isDynamicPattern("{a,b}"));
+    assert.ok(isDynamicPattern("{a,}"));
+    assert.ok(isDynamicPattern("{1..3}"));
+    assert.ok(isDynamicPattern("{1..3..5}"));
+  });
+
+  test('returns false on "!" symbols that aren\'t the first character', () => {
+    assert.ok(!isDynamicPattern("hi!"));
+  });
+
+  test("returns false on static patterns", () => {
+    assert.ok(!isDynamicPattern("."));
+    assert.ok(!isDynamicPattern("hiiii"));
+    assert.ok(!isDynamicPattern("src/index.ts"));
+  });
+
+  test("returns true on unfinished glob patterns unlike fast-glob", () => {
+    assert.ok(isDynamicPattern("+(a"));
+    assert.ok(isDynamicPattern("(b"));
+  });
+
+  test("returns true on some unfinished brace expansions unlike fast-glob", () => {
+    assert.ok(isDynamicPattern("{a,b"));
+    assert.ok(isDynamicPattern("{1..2"));
+    assert.ok(isDynamicPattern("{1..2..3"));
+  });
+
+  test("returns false on every other unfinished pattern", () => {
+    assert.ok(!isDynamicPattern("[a"));
+    assert.ok(!isDynamicPattern("{b"));
+  });
+
+  test("doesn't return true on patterns that include backslashes unlike fast-glob", () => {
+    assert.ok(!isDynamicPattern("\\"));
+    assert.ok(!isDynamicPattern("this is my favorite character: \\("));
+  });
+});
+
+// ====================
+// partial-matcher
+// ====================
+
+describe("getPartialMatcher", () => {
+  test("works with exact path", () => {
+    const matcher = getPartialMatcher(["test/utils/a"]);
+    assert.ok(matcher("test/utils/a"));
+  });
+
+  test("works with partial path", () => {
+    const matcher = getPartialMatcher(["test/utils/a"]);
+    assert.ok(matcher("test/utils"));
+  });
+
+  test("static pattern doesn't give false positives", () => {
+    const matcher = getPartialMatcher(["test/utils/a"]);
+    assert.ok(!matcher("test/utils/b"));
+    assert.ok(!matcher("test/tests"));
+    assert.ok(!matcher("src"));
+  });
+
+  test("works with dynamic pattern", () => {
+    const matcher = getPartialMatcher(["test/util?/a"]);
+    assert.ok(matcher("test/utils"));
+  });
+
+  test("works with brace expansion", () => {
+    const matcher = getPartialMatcher(["test/{utils,tests}/a"]);
+    assert.ok(matcher("test/utils/a"));
+    assert.ok(matcher("test/tests/a"));
+    assert.ok(matcher("test/utils"));
+    assert.ok(matcher("test/tests"));
+
+    assert.ok(!matcher("test/other/a"));
+    assert.ok(!matcher("test/other"));
+  });
+
+  test("works with **", () => {
+    const matcher = getPartialMatcher(["test/utils/**"]);
+    assert.ok(matcher("test"));
+    assert.ok(matcher("test/utils"));
+    assert.ok(matcher("test/utils/a"));
+    assert.ok(!matcher("test/tests/a"));
+  });
+
+  test("** doesn't match ..", () => {
+    const matcher = getPartialMatcher(["**"]);
+    assert.ok(!matcher("../hi"));
+  });
+
+  test("always match inputs with only parent directories", () => {
+    const matcher = getPartialMatcher(["**"]);
+    assert.ok(matcher("../../.."));
+  });
+
+  test("for now treats parts with / as **", () => {
+    const matcher = getPartialMatcher(["test/{utils/a,b}"]);
+    assert.ok(matcher("test"));
+    assert.ok(matcher("test/utils"));
+    assert.ok(matcher("test/utils/a"));
+
+    // only happens when treating it as **
+    assert.ok(matcher("test/notutils"));
+    assert.ok(matcher("test/notutils/a"));
+  });
+
+  test("works with weird parentheses combinations", () => {
+    const matcher = getPartialMatcher(["test/utils/(a)"]);
+    assert.ok(matcher("test/utils/a"));
+    assert.ok(matcher("test/utils"));
+    assert.ok(!matcher("test/utils/c"));
+  });
+
+  test("dot: true", () => {
+    const matcher = getPartialMatcher(["test/utils/*/c"], { dot: true });
+    assert.ok(matcher("test/utils/a/c"));
+    assert.ok(matcher("test/utils/.a/c"));
+    assert.ok(matcher("test/utils"));
+  });
+
+  test("dot: false", () => {
+    const matcher = getPartialMatcher(["test/utils/*/c"]);
+    assert.ok(matcher("test/utils/a/c"));
+    assert.ok(!matcher("test/utils/.a/c"));
+    assert.ok(matcher("test/utils"));
+  });
+
+  test("dot: false and **", () => {
+    const matcher = getPartialMatcher(["test/utils/**/c"]);
+    assert.ok(matcher("test/utils/a/c"));
+    assert.ok(!matcher("test/utils/.a/c"));
+    assert.ok(matcher("test/utils"));
+  });
+
+  test("path initially matching pattern but more input than pattern parts", () => {
+    const matcher = getPartialMatcher(["test/utils/a"]);
+    assert.ok(!matcher("test/utils/a/c"));
+  });
+
+  test("multiple patterns", () => {
+    const matcher = getPartialMatcher(["test/util?/a", "test/utils/a/c"]);
+    assert.ok(matcher("test/utils/a/c"));
+    assert.ok(matcher("test/utilg/a"));
+    assert.ok(matcher("test/utilg"));
+    assert.ok(!matcher("test/utilg/a/c"));
+  });
+
+  test("..", () => {
+    const matcher = getPartialMatcher(["../test/util?/a"]);
+    assert.ok(matcher(".."));
+    assert.ok(matcher("../test/utilg/a"));
+    assert.ok(!matcher("a/test/utilg/a"));
+    assert.ok(!matcher("test/utilg/a"));
+  });
+
+  test(".. mixed with normal pattern", () => {
+    const matcher = getPartialMatcher(["../test/util?/a", "src/utils/a"]);
+    assert.ok(matcher(".."));
+    assert.ok(matcher("../test/utilg/a"));
+    assert.ok(!matcher("a/test/utilg/a"));
+    assert.ok(!matcher("test/utilg/a"));
+
+    assert.ok(matcher("src"));
+    assert.ok(matcher("src/utils"));
+    assert.ok(!matcher("src/gaming"));
+  });
+});
